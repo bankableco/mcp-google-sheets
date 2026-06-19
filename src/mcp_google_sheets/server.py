@@ -1743,4 +1743,47 @@ def main():
             transport = sys.argv[i + 1]
             break
 
-    mcp.run(transport=transport)
+    # For HTTP-based transports (sse / streamable-http), wrap the ASGI app
+    # with a bearer-token auth check before serving it. stdio transport
+    # (local, no network exposure) runs unchanged via mcp.run().
+    if transport in ("sse", "streamable-http"):
+        import uvicorn
+        from starlette.applications import Starlette
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.responses import PlainTextResponse
+
+        AUTH_TOKEN = os.environ.get("AUTH_TOKEN")
+        if not AUTH_TOKEN:
+            logger.error(
+                "AUTH_TOKEN is not set. Refusing to start an unauthenticated "
+                "HTTP/SSE server. Set AUTH_TOKEN in the environment or use "
+                "--transport stdio."
+            )
+            sys.exit(1)
+
+        class BearerAuthMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):
+                header = request.headers.get("authorization", "")
+                expected = f"Bearer {AUTH_TOKEN}"
+                if header != expected:
+                    return PlainTextResponse("Unauthorized", status_code=401)
+                return await call_next(request)
+
+        # Build the underlying ASGI app FastMCP exposes for each transport,
+        # then wrap it with the auth middleware before serving with uvicorn.
+        if transport == "sse":
+            inner_app = mcp.sse_app()
+        else:  # streamable-http
+            inner_app = mcp.streamable_http_app()
+
+        app = Starlette(routes=inner_app.routes)
+        app.add_middleware(BearerAuthMiddleware)
+        # Preserve the lifespan (e.g. spreadsheet_lifespan) attached to the inner app
+        if getattr(inner_app, "router", None) is not None:
+            app.router.lifespan_context = inner_app.router.lifespan_context
+
+        logger.info("Starting %s transport on %s:%s with bearer-token auth enabled",
+                    transport, _resolved_host, _resolved_port)
+        uvicorn.run(app, host=_resolved_host, port=_resolved_port)
+    else:
+        mcp.run(transport=transport)
